@@ -27,9 +27,14 @@ class TikZ2PDF(object):
         self.argument_pattern = re.compile("^ *% *tikz2pdf-([^=$ ]*) *=? *(.*)")
 
         self.tikz_file = tikz_file
-        self.pdf_filename = pdf_filename
         self.tikz_filename = os.path.abspath(tikz_file.name) 
         self.tikz_dir = os.path.abspath(os.path.dirname(tikz_file.name))
+        self.pdf_filename = pdf_filename
+        # if pdf_filename is not a file, but just a folder, use filename from tex-file
+        if(not os.path.isfile(self.pdf_filename)):
+            if(self.pdf_filename == self.tikz_dir):
+                self.pdf_filename = os.path.splitext(self.tikz_filename)[0] + ".pdf"
+                self.log.debug("output file set to:%s", self.pdf_filename)
         self.work_dir = mkdtemp(prefix='tikz2pdf-')
         self.template_dir = None
         self.tex_filename = os.path.join(self.work_dir, 'final.tex')
@@ -58,6 +63,21 @@ class TikZ2PDF(object):
             self.arguments['template'].close()
         except KeyError:
             pass
+        
+    def handle_pdf_picture_path_arguments(self, old_path, new_path):
+        if os.path.isabs(new_path):
+            #got a full pdf_path
+            file_path = new_path
+        else:
+            #got a relative pdf_path to tex-file
+            file_path = self.tikz_dir + os.path.sep + new_path
+        if not file_path[-1] == os.path.sep:
+            #add '/' at the end of path
+            file_path += os.path.sep
+        if not os.path.exists(file_path):
+            os.makedirs(file_path)
+        file_path += os.path.basename(old_path)
+        return file_path
 
 
     def wait_for_changes(self):
@@ -80,12 +100,21 @@ class TikZ2PDF(object):
 
     def process(self, **command_line_arguments):
         self.arguments = self.get_arguments(**command_line_arguments)
+        if os.path.abspath(self.arguments['template'].name) == self.tikz_filename:
+            self.log.debug("Input file is template file. Aborting.")
+            return 
         for k,v in self.arguments.iteritems():
             self.log.debug("Parameter '%s' is set to '%s'", k, v)
+            
+        # apply pdf path arguments
+        self.pdf_filename = self.handle_pdf_picture_path_arguments(self.pdf_filename, self.arguments['pdf_path'])        
 
         # Load tikz
         tikz_tex = self.get_tikz()
-        if r'\documentclass' in tikz_tex:
+        if r'\begin{tikzpicture}' not in tikz_tex:
+            self.log.debug(r"Did not find \begin{tikzpicture} in tex-file. Aborting.")
+            return
+        elif r'\documentclass' in tikz_tex:
             final_tex = tikz_tex
         else:
             # Load template
@@ -164,10 +193,21 @@ class TikZ2PDF(object):
                 except:
                     pass
                 return
-
+        self.log.info("Compiling succeeded. Copying files.")
         # Copy final PDF
-        subprocess.call(['cp', os.path.join(self.work_dir, 'final.pdf'), self.pdf_filename])
+        cp_args = [os.path.join(self.work_dir, 'final.pdf'), self.pdf_filename]
+        if self.arguments['path_sep']:
+            for i in xrange(len(cp_args)):
+                cp_args[i] = cp_args[i].replace(os.path.sep,self.arguments['path_sep'])
+        subprocess.call(['cp', cp_args[0], cp_args[1]])
         self.log.info("Figure written on %s", self.pdf_filename)
+        if(self.arguments['picture']):
+            # convert PDF to picture using ImageMagick: http://www.imagemagick.org/script/index.php
+            picture_filename = self.handle_pdf_picture_path_arguments(os.path.splitext(os.path.basename(self.pdf_filename))[0] + "." + self.arguments['picture'], self.arguments['picture_path'])
+            
+            convert_command = self.arguments['ImageMagick_path'] + 'convert'
+            subprocess.call([convert_command, '-flatten', '-density', '300', '-quality', '1000', self.pdf_filename, picture_filename])
+            self.log.info("Figure converted to %s", picture_filename)
 
     
     def get_arguments(self, **command_line_arguments):
@@ -181,6 +221,11 @@ class TikZ2PDF(object):
         parser.add_argument('--xelatex', action='store_const', const='xelatex', dest='bin')
         parser.add_argument('--pdflatex', action='store_const', const='pdflatex', dest='bin')
         parser.add_argument('--preview', action='store_true')
+        parser.add_argument('--path-sep', type=str)
+        parser.add_argument('--picture', type=str)
+        parser.add_argument('--picture-path', type=str)
+        parser.add_argument('--pdf-path', type=str)
+        parser.add_argument('--ImageMagick-path', nargs='*', type=str)
         self.parser = parser
 
         # Files to look for parameters
@@ -205,6 +250,17 @@ class TikZ2PDF(object):
         # Default values in case they're not set
         arguments['number'] = arguments.get('number', 1)
         arguments['bin'] = arguments.get('bin', 'pdflatex')
+        arguments['path_sep'] = arguments.get('path_sep', '')
+        arguments['picture'] = arguments.get('picture', '')
+        arguments['picture_path'] = arguments.get('picture_path', '')
+        arguments['pdf_path'] = arguments.get('pdf_path', '')
+        arguments['ImageMagick_path'] = arguments.get('ImageMagick_path', '')
+        if(arguments['ImageMagick_path']):
+            if(type(arguments['ImageMagick_path']) == type(list())):
+                #we got a path with spaces -> insert them
+                arguments['ImageMagick_path'] = ' '.join(arguments['ImageMagick_path'])
+            if(arguments['ImageMagick_path'][-1] != os.path.sep):
+                arguments['ImageMagick_path'] += os.path.sep
         return arguments
 
 
@@ -220,7 +276,7 @@ class TikZ2PDF(object):
                     if arg == 'template':
                         value = os.path.expanduser(value)
                         if not os.path.isabs(value):
-                            value = os.path.join(os.path.dirname(tikz_file.name), value)
+                            value = os.path.join(os.path.dirname(self.tikz_file.name), value)
                         arguments.append(value)
                     else:
                         arguments.extend(value.split())
@@ -256,16 +312,25 @@ def main():
     parser.add_argument('-v', '--view', action='store_true', default=False, help="open PDF file in default viewer")
     parser.add_argument('-w', '--watch', action='store_true', default=False, help="recompile when TikZ file or template has changed")
     parser.add_argument('-x', '--xelatex', action='store_const', const='xelatex', dest='bin', help="use xelatex as compiler")
+    parser.add_argument('--path-sep', type=str, help="use custom path separator (for Windows GIT bash)")
+    parser.add_argument('--picture', type=str, help="convert output to picture with given format")
+    parser.add_argument('--picture-path', type=str, help="a path for the converted picture (full path or relative to tex-file)")
+    parser.add_argument('--pdf-path', type=str, help="a path for the converted pdf (fill path or relative to tex-file")
+    parser.add_argument('--ImageMagick-path', nargs='*', type=str, help="path to ImageMagick for converting pdf to picture")
 
     args = vars(parser.parse_args())
     tikz_files = args.pop('tikz_files')
-    output = args.pop('output', ['./'])
+    output = args.pop('output', [])
 
     if args['interactive']:
         args['edit'] = True
         args['view'] = True
         args['watch'] = True
 
+    if len(output) == 0:
+        output = ['./']*len(tikz_files)
+#        d = os.path.curdir
+#        pdf_filenames = map(lambda x: os.path.abspath(os.path.join(d, x)), output)
     if len(output) == 1 and output[0][-1] == os.path.sep:
         d = os.path.abspath(output[0])
         if tikz_files is not sys.stdin:
@@ -273,7 +338,7 @@ def main():
         else:
             pdf_filenames = ['out.pdf']
     elif len(output) != len(tikz_files):
-        self.log.error("Error: Number of output files does not match number of input files. Consider specifying a directory with a trailing slash")
+        print "Error: Number of output files does not match number of input files. Consider specifying a directory with a trailing slash"
         exit(1)
     else:
         d = os.path.curdir
